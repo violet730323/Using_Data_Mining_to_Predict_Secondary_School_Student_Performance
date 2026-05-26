@@ -1,0 +1,1700 @@
+---
+title: "Team13 FinalProject"
+output:
+  pdf_document:
+    latex_engine: xelatex
+knitr:
+  opts_chunk:
+    error: true
+---
+
+## Team 13 - Bryce Marin, Latisha Khorana, Turner Mathieux, Violet Zhao
+
+### Sections: Data Prep | Decision Trees | PCA + Decision Tree | Random Forest | SVM  | Neural Network
+
+````{r, error=TRUE}
+````
+
+### Loading all the Libraries
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+library(dplyr)
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+library(ggplot2)
+if (!requireNamespace("tree", quietly = TRUE)) install.packages("tree")
+library(tree)
+if (!requireNamespace("pROC", quietly = TRUE)) install.packages("pROC")
+library(pROC)
+if (!requireNamespace("nnet", quietly = TRUE)) install.packages("nnet")
+library(nnet)
+if (!requireNamespace("reshape2", quietly = TRUE)) install.packages("reshape2")
+library(reshape2)
+if (!requireNamespace("randomForest", quietly = TRUE)) install.packages("randomForest")
+library(randomForest)
+if (!requireNamespace("caret", quietly = TRUE)) install.packages("caret")
+library(caret)
+if (!requireNamespace("kernlab", quietly = TRUE)) install.packages("kernlab")
+library(kernlab)
+if (!requireNamespace("e1071", quietly = TRUE)) install.packages("e1071")
+library(e1071)
+if (!requireNamespace("themis", quietly = TRUE)) install.packages("themis")
+library(themis)
+```
+
+## Data Preperation and Segmentation
+
+```{r}
+d1 <- read.table("./data/student-mat.csv", 
+                 sep = ";", 
+                 header = TRUE)
+d2 <- read.table("./data/student-por.csv", 
+                 sep = ";", 
+                 header = TRUE)
+d3=merge(d1,d2,by=c("school","sex","age","address","famsize","Pstatus","Medu","Fedu","Mjob",
+                    "Fjob","reason","nursery","internet"))
+nrow(d3) # 382 students
+unique(d3$school) #gp and ms
+unique(d3$age) #15 16 17 18 19 20 22
+summary(d3)
+
+library(dplyr)
+#### Resolve Data Leakage & Redundancy
+# Remove the Portuguese-specific columns (.y) and clean the Math column names (.x).
+# This ensures the model isn't confused by having the same data twice, especially with the
+# tree considering that it is very sensitive to the datapoints.
+df_clean <- d3 %>% 
+   select(-ends_with(".y")) %>%
+   rename_with(~gsub(".x", "", .x), ends_with(".x"))
+summary(df_clean)
+
+# Instead of predicting the final grade, we predict the 'Progress' delta.
+# This forces the model to explain why a student improved or declined as opposed to just
+# saying if you failed in the past you will fail again
+# G3_diff > 0 means the student improved since the midterm
+df_clean$G3_progress <- df_clean$G3 - df_clean$G2
+
+# The summary showed max absences of 75. cap it to prevent a skewed tree - A student with
+# 75 absences is an extreme outlier. In a Decision Tree, extreme outliers create 'pure'
+# but useless branches that don't generalize. Capping at 30 stabilizes the variance of
+# the 'absences' variable.
+df_clean$absences <- ifelse(df_clean$absences > 30, 30, df_clean$absences)
+
+# Binary Transform (Making Yes/No 1/0 for cleaner splits) - Helps set up for the decision
+# tree and makes it less viable for the decision tree to get confused
+char_to_binary <- c("schoolsup", "famsup", "paid", "activities", "nursery", "higher",
+                    "internet", "romantic")
+df_clean[char_to_binary] <- lapply(df_clean[char_to_binary], 
+                                   function(x) ifelse(x == "yes", 1, 0))
+df_clean <- df_clean %>% mutate(across(where(is.character), as.factor))
+df_preemptive <- df_clean %>% select(-G1, -G2)
+
+hist(df_preemptive$G3)
+table(df_preemptive$G3)
+
+df_preemptive <- df_clean %>% select(-G1, -G2) %>% filter(G3 > 0)
+
+#### Creating the Sub segments
+# d1 is the math data
+# d2 is the portuguese data
+
+d1_math_clean <- d1
+d1_math_clean$absences <- ifelse(d1_math_clean$absences > 30, 30, d1_math_clean$absences)
+d1_math_clean$G3_progress <- d1_math_clean$G3-d1_math_clean$G2
+char_to_binary <- c("schoolsup", "famsup", "paid", "activities", "nursery", "higher",
+                    "internet", "romantic")
+d1_math_clean[char_to_binary] <- lapply(d1_math_clean[char_to_binary],
+                                        function(x) ifelse(x == "yes", 1, 0))
+
+d2_port_clean <- d2
+d2_port_clean$absences <- ifelse(d2_port_clean$absences > 30, 30, d2_port_clean$absences)
+d2_port_clean$G3_progress <- d2_port_clean$G3-d2_port_clean$G2
+char_to_binary <- c("schoolsup", "famsup", "paid", "activities", "nursery", "higher",
+                    "internet", "romantic")
+d2_port_clean[char_to_binary] <- lapply(d2_port_clean[char_to_binary],
+                                        function(x) ifelse(x == "yes", 1, 0))
+
+summary(d1_math_clean$G3_progress)
+# Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
+# -10.0000   0.0000   0.0000  -0.2987   1.0000   3.0000
+
+summary(d2_port_clean$G3_progress)
+# Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
+# -9.0000  0.0000  0.0000  0.3359  1.0000  6.0000
+
+#### Segmentation Strategy
+# Declining: Less than 0 (e.g., -10 to -1)
+# Stable: Exactly 0
+# Improving: Greater than 0 (e.g., 1 to 6)
+
+# For Math Data
+d1_math_clean <- d1_math_clean %>%
+  mutate(progress_segment = cut(G3_progress, 
+                                breaks = c(-Inf, -0.1, 0.1, Inf), 
+                                labels = c("Declining", "Stable", "Improving")))
+# For Portuguese Data
+d2_port_clean <- d2_port_clean %>%
+  mutate(progress_segment = cut(G3_progress, 
+                                breaks = c(-Inf, -0.1, 0.1, Inf), 
+                                labels = c("Declining", "Stable", "Improving")))
+
+df_preemptive_math <- d1_math_clean %>% select(-G1, -G2) %>% filter(G3 > 0)
+df_preemptive_port <- d2_port_clean %>% select(-G1, -G2) %>% filter(G3 > 0)
+```
+
+## Decision Tree
+
+```{r, error=TRUE, warning=FALSE, message=FALSE}
+set.seed(123)
+
+# MATH: Final Grade Prediction 
+tree_math_social <- tree(G3 ~ ., data = df_preemptive_math)
+plot(tree_math_social)
+text(tree_math_social, pretty = 0, cex = 0.7)
+title("Math: Social Factors & Final Grade")
+
+# Pruning Math Tree
+cv_math <- cv.tree(tree_math_social)
+cv_math
+tree_math_pruned <- prune.tree(tree_math_social, best = 7) 
+plot(tree_math_pruned)
+text(tree_math_pruned, pretty = 0, cex = 0.7)
+
+# MATH: Progress Prediction
+# Removing G3 to avoid leakage when predicting progress
+math_progress_data <- df_preemptive_math %>% select(-G3, -progress_segment)
+tree_math_move <- tree(G3_progress ~ ., data = math_progress_data)
+plot(tree_math_move)
+text(tree_math_move, pretty = 0, cex = 0.7)
+title("Math: Factors Predicting Improvement/Decline")
+
+# Pruning Math Social Tree
+cv_math_social <- cv.tree(tree_math_move)
+cv_math_social
+tree_math_pruned_social <- prune.tree(tree_math_social, best = 2) 
+plot(tree_math_pruned_social)
+text(tree_math_pruned_social, pretty = 0, cex = 0.7)
+
+
+set.seed(123)
+
+# PORTUGUESE: Final Grade Prediction
+tree_port_social <- tree(G3 ~ ., data = df_preemptive_port)
+plot(tree_port_social)
+text(tree_port_social, pretty = 0, cex = 0.7)
+title("Portuguese: Social Factors & Final Grade")
+cv_port <- cv.tree(tree_port_social)
+cv_port
+tree_port_pruned <- prune.tree(tree_port_social, best = 4) 
+plot(tree_port_pruned)
+text(tree_port_pruned, pretty = 0, cex = 0.7)
+
+# PORTUGUESE: Progress Prediction 
+port_progress_data <- df_preemptive_port %>% select(-G3, -progress_segment)
+# tree_port_move <- tree(G3_progress ~ ., data = port_progress_data) 
+# - in plot.tree(tree_port_move) : cannot plot singlenode tree
+
+# Math is "Sensitive" to Social Factors: In the Math dataset (d1), variables like failures
+# and schoolsup successfully predicted grade movement. 
+# This suggests that a student's environment and past academic record have a high impact
+# on their Math progress.
+
+# Portuguese is "Resilient" to Social Factors: The "singlenode" error proves that for the
+# Portuguese class (d2), factors like family relationships, parents' jobs, and even
+# past failures could not reliably predict whether a student improved or declined.
+
+# The Interpretation: We could argue that Portuguese (a native language subject) is less
+# dependent on the specific social/behavioral "shocks" measured in this dataset compared
+# to a cumulative technical subject like Math.
+
+#### Math: Additional Breakdown
+math_declining <- df_preemptive_math %>% 
+  filter(progress_segment == "Declining") %>%
+  select(-G3, -progress_segment)
+math_stable <- df_preemptive_math %>% 
+  filter(progress_segment == "Stable") %>%
+  select(-G3, -progress_segment)
+math_improving <- df_preemptive_math %>%
+  filter(progress_segment == "Improving") %>%
+  select(-G3, -progress_segment)
+
+tree_math_declining <- tree(G3_progress ~ ., data = math_declining)
+tree_math_stable    <- tree(G3_progress ~ ., data = math_stable)
+tree_math_improving <- tree(G3_progress ~ ., data = math_improving)
+
+cv_math_declining <- cv.tree(tree_math_declining)
+cv_math_stable    <- cv.tree(tree_math_stable)
+cv_math_improving <- cv.tree(tree_math_improving)
+
+tree_math_declining_pruned <- prune.tree(tree_math_declining,
+      best = cv_math_declining$size[which.min(cv_math_declining$dev)])
+tree_math_stable_pruned <- prune.tree(tree_math_stable,
+      best = max(2, cv_math_stable$size[which.min(cv_math_stable$dev)]))
+tree_math_improving_pruned <- prune.tree(tree_math_improving, 
+      best = max(2, cv_math_improving$size[which.min(cv_math_improving$dev)]))
+
+# Then plot all three
+par(mfrow = c(1, 2))
+plot(tree_math_declining_pruned);
+text(tree_math_declining_pruned, pretty = 0, cex = 0.7);
+title("Math | Declining")
+plot(tree_math_stable_pruned);
+text(tree_math_stable_pruned, pretty = 0, cex = 0.7);
+title("Math | Stable")
+plot(tree_math_improving_pruned); 
+text(tree_math_improving_pruned, pretty = 0, cex = 0.7);
+title("Math | Improving")
+
+#### Port: Additional Breakdown
+port_declining <- df_preemptive_port %>%
+  filter(progress_segment == "Declining") %>%
+  select(-G3, -progress_segment)
+port_stable <- df_preemptive_port %>%
+  filter(progress_segment == "Stable") %>%
+  select(-G3, -progress_segment)
+port_improving <- df_preemptive_port %>%
+  filter(progress_segment == "Improving") %>%
+  select(-G3, -progress_segment)
+
+tree_port_declining <- tree(G3_progress ~ ., data = port_declining)
+tree_port_stable    <- tree(G3_progress ~ ., data = port_stable)
+tree_port_improving <- tree(G3_progress ~ ., data = port_improving)
+
+cv_port_declining <- cv.tree(tree_port_declining)
+cv_port_stable    <- cv.tree(tree_port_stable)
+cv_port_improving <- cv.tree(tree_port_improving)
+
+tree_port_declining_pruned <- prune.tree(tree_port_declining,
+      best = cv_port_declining$size[which.min(cv_port_declining$dev)])
+tree_port_declining_pruned <- prune.tree(tree_port_declining, 
+      best = max(2, cv_port_declining$size[which.min(cv_port_declining$dev)]))
+tree_port_improving_pruned <- prune.tree(tree_port_improving,
+      best = max(2, cv_port_improving$size[which.min(cv_port_improving$dev)]))
+
+par(mfrow = c(1, 2))
+plot(tree_port_declining_pruned);
+text(tree_port_declining_pruned, pretty = 0, cex = 0.7);
+title("Portuguese | Declining")
+plot(tree_port_stable_pruned);
+text(tree_port_stable_pruned, pretty = 0, cex = 0.7);
+title("Portuguese | Stable")
+plot(tree_port_improving_pruned);
+text(tree_port_improving_pruned, pretty = 0, cex = 0.7);
+title("Portuguese | Improving")
+
+# MATH tree_social RMSE
+math_pred <- predict(tree_math_pruned, df_preemptive_math)
+math_rmse <- sqrt(mean((df_preemptive_math$G3 - math_pred)^2))
+cat("Math tree_social RMSE:", math_rmse)
+
+# MATH tree_move RMSE
+math_move_pred <- predict(tree_math_pruned_social, math_progress_data)
+math_move_rmse <- sqrt(mean((math_progress_data$G3_progress - math_move_pred)^2))
+cat("Math tree_move RMSE:", math_move_rmse)
+
+# PORTUGUESE tree_social RMSE
+port_pred <- predict(tree_port_pruned, df_preemptive_port)
+port_rmse <- sqrt(mean((df_preemptive_port$G3 - port_pred)^2))
+cat("Portuguese tree_social RMSE:", port_rmse)
+```
+
+## PCA + Decision Tree
+
+```{r warning=FALSE, message=FALSE}
+# SECTION 3.1: PREPARE NUMERIC-ONLY FEATURES FOR PCA
+# We drop the targets (G3, G3_progress, progress_segment) so the PCA captures student
+# background factors only, not outcomes, preventing leakage into the components.
+
+# Pull only numeric predictor columns for Math
+math_features <- df_preemptive_math %>%
+  select(-G3, -G3_progress, -progress_segment) %>%
+  select(where(is.numeric))
+
+# Pull only numeric predictor columns for Portuguese
+port_features <- df_preemptive_port %>%
+  select(-G3, -G3_progress, -progress_segment) %>%
+  select(where(is.numeric))
+
+# Check means and variances before scaling 
+apply(math_features, 2, mean)
+apply(math_features, 2, var)
+
+apply(port_features, 2, mean)
+apply(port_features, 2, var)
+
+# Scale both datasets (mean = 0, sd = 1)
+# Required before PCA so variables on different scales don't dominate
+Math.Scaled <- scale(math_features)
+Port.Scaled <- scale(port_features)
+
+# SECTION 3.2: RUN PCA
+# scale = TRUE standardizes variables
+
+# Run PCA on Math features
+pr.math <- prcomp(math_features, scale = TRUE)
+
+# Run PCA on Portuguese features
+pr.port <- prcomp(port_features, scale = TRUE)
+
+# Inspect the PCA objects
+names(pr.math)
+names(pr.port)
+
+# We ran the following lines in the original code of course but we have commented it
+# out here to save you from having to scroll through 20+ pages of loading vectors
+# and PC scores.
+
+pr.math$center    # raw variable means (Math)
+pr.math$scale     # raw variable SDs   (Math)
+# pr.math$rotation  # loading vectors    (Math) — which features drive each PC
+# pr.math$x         # PC scores          (Math) — each student's position on each PC
+
+pr.port$center
+pr.port$scale
+# pr.port$rotation  # loading vectors (Portuguese)
+# pr.port$x         # PC scores       (Portuguese)
+
+# Full summary: SDs, % variance, cumulative % variance
+summary(pr.math)
+summary(pr.port)
+
+# SECTION 3.3: VARIANCE EXPLAINED + SCREE PLOTS
+
+# Compute PC variances (eigenvalues)
+pr.var.math <- pr.math$sdev^2
+pr.var.port <- pr.port$sdev^2
+
+# Total variance should equal number of features (all scaled to var = 1)
+sum(pr.var.math)
+sum(pr.var.port)
+
+# Proportion of Variance Explained (PVE)
+pve.math <- pr.var.math / sum(pr.var.math)
+pve.port <- pr.var.port / sum(pr.var.port)
+
+pve.math
+pve.port
+
+# Scree plots: PVE and Cumulative PVE
+par(mfrow = c(2, 2))
+
+plot(pve.math,
+     xlab = "Principal Component",
+     ylab = "Proportion of Variance Explained",
+     ylim = c(0, 1), type = "b",
+     main = "Math: PVE by Component")
+
+plot(cumsum(pve.math),
+     xlab = "Principal Component",
+     ylab = "Cumulative Proportion of Variance Explained",
+     ylim = c(0, 1), type = "b",
+     main = "Math: Cumulative PVE")
+
+plot(pve.port,
+     xlab = "Principal Component",
+     ylab = "Proportion of Variance Explained",
+     ylim = c(0, 1), type = "b",
+     main = "Portuguese: PVE by Component")
+
+plot(cumsum(pve.port),
+     xlab = "Principal Component",
+     ylab = "Cumulative Proportion of Variance Explained",
+     ylim = c(0, 1), type = "b",
+     main = "Portuguese: Cumulative PVE")
+
+par(mfrow = c(1, 1))
+
+# SECTION 3.4: BIPLOTS
+# Visualize which features load most heavily on PC1 and PC2
+
+par(mfrow = c(1, 2))
+biplot(pr.math, center = TRUE, scale = 0, cex = 0.5,
+       main = "Math: PCA Biplot (PC1 vs PC2)")
+biplot(pr.port, center = TRUE, scale = 0, cex = 0.5,
+       main = "Portuguese: PCA Biplot (PC1 vs PC2)")
+par(mfrow = c(1, 1))
+
+# Print loadings to see which variables drive each PC
+pr.math$rotation  # Math loadings
+pr.port$rotation  # Portuguese loadings
+
+# SECTION 3.5: COMBINE PC SCORES WITH SCALED DATA
+
+# Combine scaled features + all PC scores into one dataframe
+Math.PCscores <- data.frame(Math.Scaled, pr.math$x)
+Port.PCscores <- data.frame(Port.Scaled, pr.port$x)
+
+View(Math.PCscores)
+View(Port.PCscores)
+
+# Verify: manually compute PC1 score for student 1 (Math)
+# PC1 score = sum of (loading * scaled feature value) across all features
+# This should match pr.math$x[1, 1]
+Student1.Math.PC1 <- sum(pr.math$rotation[, 1] * Math.Scaled[1, ])
+Student1.Math.PC1 # 0.4249391
+pr.math$x[1, 1]  # should match & it does match
+
+# SECTION 3.6: CHOOSE NUMBER OF PCs TO KEEP
+# Rule: keep enough PCs to explain at least 80% of variance.
+
+# How many PCs does it take to hit 80% for Math?
+which(cumsum(pve.math) >= 0.80)[1] #14
+
+# How many PCs does it take to hit 80% for Portuguese?
+which(cumsum(pve.port) >= 0.80)[1] #14
+
+# Store the cutoffs
+npc_math <- which(cumsum(pve.math) >= 0.80)[1]
+npc_port <- which(cumsum(pve.port) >= 0.80)[1]
+
+cat("Math: PCs needed for 80% variance =", npc_math, "\n") 
+# Math: PCs needed for 80% variance = 14 
+
+cat("Portuguese: PCs needed for 80% variance =", npc_port, "\n") 
+# Portuguese: PCs needed for 80% variance = 14 
+
+# Note the answers are the same for both 
+
+# SECTION 3.7: BUILD TREE-READY DATASETS FROM PC SCORES
+
+# Math: select top PCs + attach target
+math_tree_df <- data.frame(pr.math$x[, 1:npc_math])
+math_tree_df$G3_progress <- df_preemptive_math$G3_progress
+
+# Portuguese: select top PCs + attach target
+port_tree_df <- data.frame(pr.port$x[, 1:npc_port])
+port_tree_df$G3_progress <- df_preemptive_port$G3_progress
+
+View(math_tree_df)
+View(port_tree_df)
+
+# SECTION 3.8: DECISION TREE ON PCA COMPONENTS
+# Predict G3_progress from PC scores.
+
+set.seed(123)
+
+# MATH: Full Tree on PCA Components 
+
+tree.math.pca <- tree(G3_progress ~ ., data = math_tree_df)
+plot(tree.math.pca)
+text(tree.math.pca, pretty = 0, cex = 0.7)
+title("Math: G3 Progress Predicted from PCA Components")
+
+summary(tree.math.pca)
+
+# MATH: Cross-Validate and Prune
+cv.math.pca <- cv.tree(tree.math.pca)
+cv.math.pca
+
+# Find the optimal tree size (fewest nodes at lowest deviance)
+best.math.pca <- cv.math.pca$size[which.min(cv.math.pca$dev)]
+best.math.pca <- max(2, best.math.pca)  # ensure at least 2 terminal nodes
+cat("Math PCA tree: optimal size =", best.math.pca, "\n")
+
+tree.math.pca.pruned <- prune.tree(tree.math.pca, best = best.math.pca)
+plot(tree.math.pca.pruned)
+text(tree.math.pca.pruned, pretty = 0, cex = 0.7)
+title("Math: Pruned PCA Tree — G3 Progress")
+
+
+# MATH: RMSE
+
+math.pca.pred <- predict(tree.math.pca.pruned, math_tree_df)
+math.pca.rmse <- sqrt(mean((math_tree_df$G3_progress - math.pca.pred)^2))
+cat("Math PCA Tree RMSE:", math.pca.rmse, "\n")
+# Math PCA Tree RMSE: 0.8028644 
+
+# PORTUGUESE: Full Tree on PCA Components 
+
+set.seed(123)
+tree.port.pca <- tree(G3_progress ~ ., data = port_tree_df)
+plot(tree.port.pca)
+text(tree.port.pca, pretty = 0, cex = 0.7)
+title("Portuguese: G3 Progress Predicted from PCA Components")
+
+summary(tree.port.pca)
+
+
+# PORTUGUESE: Cross-Validate and Prune
+
+cv.port.pca <- cv.tree(tree.port.pca)
+cv.port.pca
+
+best.port.pca <- cv.port.pca$size[which.min(cv.port.pca$dev)]
+best.port.pca <- max(2, best.port.pca)
+cat("Portuguese PCA tree: optimal size =", best.port.pca, "\n")
+
+tree.port.pca.pruned <- prune.tree(tree.port.pca, best = best.port.pca)
+plot(tree.port.pca.pruned)
+text(tree.port.pca.pruned, pretty = 0, cex = 0.7)
+title("Portuguese: Pruned PCA Tree — G3 Progress")
+
+
+# PORTUGUESE: RMSE 
+
+port.pca.pred <- predict(tree.port.pca.pruned, port_tree_df)
+port.pca.rmse <- sqrt(mean((port_tree_df$G3_progress - port.pca.pred)^2))
+cat("Portuguese PCA Tree RMSE:", port.pca.rmse, "\n")
+#Portuguese PCA Tree RMSE: 0.9530515
+
+
+# math.raw.rmse <- 2.781059
+# port.raw.rmse <- 2.300445
+
+table(tree.math.pca.pruned$frame$var)
+table(tree.port.pca.pruned$frame$var)
+```
+
+#### Random Forest
+
+
+```{r rf}
+d1_math_clean <- d1
+
+# Cap absences at 30 (same cutoff as DT)
+d1_math_clean$absences <- ifelse(d1_math_clean$absences > 30, 30, d1_math_clean$absences)
+
+# Engineer G3_progress = G3 - G2
+d1_math_clean$G3_progress <- d1_math_clean$G3 - d1_math_clean$G2
+
+# Binary encode yes/no columns
+char_to_binary <- c("schoolsup", "famsup", "paid", "activities",
+                    "nursery", "higher", "internet", "romantic")
+d1_math_clean[char_to_binary] <- lapply(
+  d1_math_clean[char_to_binary],
+  function(x) ifelse(x == "yes", 1, 0)
+)
+
+# Convert remaining character columns to factors 
+d1_math_clean <- d1_math_clean %>%
+  mutate(across(where(is.character), as.factor))
+
+# Remove G1, G2 and filter G3=0 dropouts
+df_preemptive_math <- d1_math_clean %>%
+  select(-G1, -G2) %>%
+  filter(G3 > 0)
+
+cat("Math after cleaning:", nrow(df_preemptive_math), "\n") # 357
+
+# STEP 3: Clean Portuguese data 
+d2_port_clean <- d2
+
+d2_port_clean$absences <- ifelse(d2_port_clean$absences > 30, 30, d2_port_clean$absences)
+d2_port_clean$G3_progress <- d2_port_clean$G3 - d2_port_clean$G2
+
+d2_port_clean[char_to_binary] <- lapply(
+  d2_port_clean[char_to_binary],
+  function(x) ifelse(x == "yes", 1, 0)
+)
+
+d2_port_clean <- d2_port_clean %>%
+  mutate(across(where(is.character), as.factor))
+
+df_preemptive_port <- d2_port_clean %>%
+  select(-G1, -G2) %>%
+  filter(G3 > 0)
+
+cat("Portuguese after cleaning:", nrow(df_preemptive_port), "\n")#634
+
+## ── STEP 3: Create progress_segment ─────────────────────────
+# Reuse DT teammate's segmentation logic exactly:
+#   Declining:  G3_progress < 0
+#   Stable:     G3_progress = 0
+#   Improving:  G3_progress > 0
+
+# Math
+df_preemptive_math$progress_segment <- cut(
+  df_preemptive_math$G3_progress,
+  breaks = c(-Inf, -0.1, 0.1, Inf),
+  labels = c("Declining", "Stable", "Improving")
+)
+
+# Portuguese
+df_preemptive_port$progress_segment <- cut(
+  df_preemptive_port$G3_progress,
+  breaks = c(-Inf, -0.1, 0.1, Inf),
+  labels = c("Declining", "Stable", "Improving")
+)
+
+# Check distribution — see how many students fall in each category
+cat("===== Math progress_segment distribution =====\n")
+print(table(df_preemptive_math$progress_segment))
+print(prop.table(table(df_preemptive_math$progress_segment)))
+# Declining    Stable Improving 
+# 65       181       111 
+
+# Declining    Stable Improving 
+# 0.1820728 0.5070028 0.3109244 
+
+# Among 357 Math students, 65 regressed (18.2%), 181 remained the same (50.7%), and 111
+# improved (31.1%).
+
+cat("\n===== Portuguese progress_segment distribution =====\n")
+print(table(df_preemptive_port$progress_segment))
+print(prop.table(table(df_preemptive_port$progress_segment)))
+# Declining    Stable Improving 
+# 64       280       290 
+
+# Declining    Stable Improving 
+# 0.1009464 0.4416404 0.4574132 
+
+# There were 634 students studying Portuguese: 64 saw their marks drop (10.1%), 280
+# remained the same (44.2%), and 290 improved (45.7%). This suggests that performance
+# in Portuguese, as a subject taught in the students’ mother tongue, is more stable,
+# and students are less likely to see their marks drop. The proportion of students who
+# improved was higher (45.7% compared to 31.1% in Maths), with nearly half of the
+# students showing improvement.
+
+# STEP 4: BUILD 4 RF MODELS randomForest
+# When you write `importance = TRUE`, after building 500 trees, the RF performs an
+# additional round of calculations: it shuffles each variable individually, measures
+# the increase in error, and stores the results in the model object. When you
+# subsequently call `varImpPlot(rf_social_math, type = 1)`, it retrieves the data from
+# these stored results to plot the graph.
+# ============================================================
+# Structure mirrors DT exactly:
+#   rf_social → predict G3 (where will student end up?)
+#   rf_move   → predict G3_progress (how much will they move?)
+#
+# IMPORTANT: must remove G3_progress when predicting G3 (and vice versa)
+#            otherwise one target leaks into the other
+
+# ── 4A: rf_social_math ──────────────────────────────────────
+# Target: G3 (final grade)
+# Remove: G3_progress (derived from G3, would leak)
+
+set.seed(123)
+rf_social_math <- randomForest(
+     G3 ~ .,
+     data       = df_preemptive_math %>% select(-G3_progress),
+     ntree      = 500,
+     importance = TRUE)     # needed for %IncMSE plot)
+print(rf_social_math)
+#  Mean of squared residuals → 8.421954
+#          % Var explained → 18.94
+
+# ── 4B: rf_social_port ──────────────────────────────────────
+# Target: G3 (final grade)
+# Same setup, different dataset
+
+set.seed(123)
+rf_social_port <- randomForest(
+     G3 ~ .,
+     data       = df_preemptive_port %>% select(-G3_progress),
+     ntree      = 500,
+     importance = TRUE)
+print(rf_social_port)
+#  Mean of squared residuals → 4.652499
+#          % Var explained → 35.69
+
+# ── 4C: rf_move_math Build classification RF models────────────────────────────────────────
+# Remove G3 (data leakage) and G3_progress (target is derived from it)
+# Keep progress_segment as the target
+# randomForest auto-detects classification when target is a factor
+
+# rf_move_math (classification)
+set.seed(42)
+rf_move_math <- randomForest(
+     progress_segment ~ .,
+     data       = df_preemptive_math %>% select(-G3, -G3_progress),
+     ntree      = 500,
+     importance = TRUE)
+
+cat("\n===== rf_move_math (Classification) =====\n")
+print(rf_move_math)
+# Key outputs to note:
+#   OOB estimate of error rate → 53.22%
+#   Confusion matrix → shows where model gets it right/wrong
+# Confusion matrix:
+# Declining Stable Improving class.error
+# Declining         3     56         6   0.9538462
+# Stable            0    149        32   0.1767956
+# Improving         0     96        15   0.8648649
+
+# rf_move_port (classification)
+set.seed(42)
+rf_move_port <- randomForest(
+     progress_segment ~ .,
+     data       = df_preemptive_port %>% select(-G3, -G3_progress),
+     ntree      = 500,
+     importance = TRUE)
+
+cat("\n===== rf_move_port (Classification) =====\n")
+print(rf_move_port)
+# Key outputs to note:
+#   OOB estimate of error rate → 52.68%
+# Confusion matrix:
+# Declining Stable Improving class.error
+# Declining         0     23        41   1.0000000
+# Stable            1    134       145   0.5214286
+# Improving         1    123       166   0.4275862
+
+
+# STEP 5: 10-FOLD CROSS-VALIDATION RMSE
+# ============================================================
+# This gives honest out-of-sample RMSE
+# Comparable to paper's method and to DT's cv.tree() results
+
+cv_control <- trainControl(method = "cv", number = 10)
+
+# rf_social_math CV
+set.seed(123)
+cv_social_math <- train(
+     G3 ~ .,
+     data      = df_preemptive_math %>% select(-G3_progress),
+     method    = "rf",
+     trControl = cv_control,
+     ntree     = 500)
+print(cv_social_math)
+
+# rf_social_port CV
+set.seed(123)
+cv_social_port <- train(
+     G3 ~ .,
+     data      = df_preemptive_port %>% select(-G3_progress),
+     method    = "rf",
+     trControl = cv_control,
+     ntree     = 500)
+
+# ── 10-Fold CV Accuracy ─────────────────────────────
+# Classification uses Accuracy instead of RMSE
+
+cv_control <- trainControl(method = "cv", number = 10)
+
+# rf_move_math CV
+set.seed(42)
+cv_move_math <- train(
+     progress_segment ~ .,
+     data      = df_preemptive_math %>% select(-G3, -G3_progress),
+     method    = "rf",
+     trControl = cv_control,
+     ntree     = 500)
+
+cat("\n===== rf_move_math CV Results =====\n")
+print(cv_move_math)
+# Look at: Accuracy and Kappa   
+# Kappa adjusts for class imbalance — more honest than raw accuracy
+# mtry    Accuracy   Kappa       
+#   2    0.4905491  -0.009955717
+
+# rf_move_port CV
+set.seed(42)
+cv_move_port <- train(
+     progress_segment ~ .,
+     data      = df_preemptive_port %>% select(-G3, -G3_progress),
+     method    = "rf",
+     trControl = cv_control,
+     ntree     = 500
+)
+
+cat("\n===== rf_move_port CV Results =====\n")
+print(cv_move_port)
+# mtry  Accuracy   Kappa     
+#2    0.4982887  0.08922893
+
+print("\n===== 10-Fold CV RMSE =====\n")
+cat("rf_social_math CV RMSE:", round(min(cv_social_math$results$RMSE), 3), "\n")
+#rf_social_math CV RMSE: 2.86  
+cat("rf_social_port CV RMSE:", round(min(cv_social_port$results$RMSE), 3), "\n")
+#rf_social_port CV RMSE: 2.155
+
+
+# STEP 6: VARIABLE IMPORTANCE PLOTS
+# =========================================================
+
+# In a randomised impact plot, for each variable (such as ‘failures’), RF shuffles the
+# values of that variable across all samples and then re-runs the model to see by how
+# much the prediction error increases. If the error skyrockets by 16% after shuffling
+# ‘failures’, this indicates that the model is highly dependent on it, and it is
+# therefore important. If the error remains virtually unchanged after shuffling a
+# particular variable, this suggests that the model does not require it at all.
+
+## type=1 → %IncMSE (how much error increases when variable is shuffled)
+plot_importance_labeled <- function(rf_model, title, n.var = 15) {
+     # abstract importance data
+     imp <- importance(rf_model, type = 1)  # type=1 = %IncMSE
+     imp_df <- data.frame(
+          Variable = rownames(imp),
+          IncMSE   = round(imp[, 1], 1))
+     # Sort by importance and take the top n.var items
+     imp_df <- imp_df[order(imp_df$IncMSE, decreasing = FALSE), ]
+     imp_df <- tail(imp_df, n.var)  # Take the last n.var rows (the most important ones)
+     # horizontal bar chart
+     bp <- barplot(
+          imp_df$IncMSE,
+          names.arg = imp_df$Variable,
+          horiz     = TRUE,           # horizontal 
+          las       = 1,              # name
+          col       = "#B5D4F4",      
+          border    = "#185FA5",      
+          xlab      = "%IncMSE",
+          main      = title )
+     #label
+     text(
+          x      = imp_df$IncMSE + max(imp_df$IncMSE) * 0.03,  
+          y      = bp,
+          labels = paste0(imp_df$IncMSE, "%"),
+          cex    = 0.8,
+          adj    = 0    )} # # Left-aligned 
+varImpPlot(rf_social_math, type = 1, n.var = 5,
+           main = "rf_social_math: Variable Importance\n(Predicting G3 — Math)")
+varImpPlot(rf_social_port, type = 1, n.var = 5,
+           main = "rf_social_port: Variable Importance
+           \n(Predicting G3 — Portuguese)")
+varImpPlot(rf_move_math, type = 1, n.var = 5,
+           main = "rf_move_math: Variable Importance
+           \n(Predicting Progress Direction — Math)")
+varImpPlot(rf_move_port, type = 1, n.var = 5,
+           main = "rf_move_port: Variable Importance
+           \n(Predicting Progress Direction — Portuguese)")
+
+par(mfrow = c(1, 1))
+
+# ggplot rf_social_math
+imp <- importance(rf_social_math, type = 1)
+imp_df <- data.frame(
+     variable = rownames(imp),
+     IncMSE   = imp[, 1]
+)
+imp_df <- imp_df %>% arrange(desc(IncMSE)) %>% head(5)
+
+ggplot(imp_df, aes(x = reorder(variable, IncMSE), y = IncMSE)) +
+     geom_col(fill = "steelblue") +
+     geom_text(aes(label = paste0(round(IncMSE, 1), "%")),
+               hjust = -0.1, size = 3.5) +
+     coord_flip() +
+     labs(title = "rf_social_math: Variable Importance",
+          x = NULL, y = "%IncMSE") +
+     theme_minimal()
+# failures 16.8%，schoolsup 16.3%
+
+# ggplot rf_social_port
+imp2 <- importance(rf_social_port, type = 1)
+imp2_df <- data.frame(
+     variable = rownames(imp2),
+     IncMSE   = imp2[, 1]
+)
+imp2_df <- imp2_df %>% arrange(desc(IncMSE)) %>% head(5)
+
+ggplot(imp2_df, aes(x = reorder(variable, IncMSE), y = IncMSE)) +
+     geom_col(fill = "steelblue") +
+     geom_text(aes(label = paste0(round(IncMSE, 1), "%")),
+               hjust = -0.1, size = 3.5) +
+     coord_flip() +
+     labs(title = "rf_social_port: Variable Importance",
+          x = NULL, y = "%IncMSE") +
+     theme_minimal()
+# failures 38.1%， higher 25.4%
+
+# ggplot rf_move_math
+# Math
+imp_math <- importance(rf_move_math, type = 1)
+imp_math_df <- data.frame(
+     variable = rownames(imp_math),
+     MeanDecreaseAccuracy = imp_math[, "MeanDecreaseAccuracy"]
+)
+imp_math_df <- imp_math_df %>% arrange(desc(MeanDecreaseAccuracy)) %>% head(10)
+
+ggplot(imp_math_df, aes(x = reorder(variable, MeanDecreaseAccuracy),
+                        y = MeanDecreaseAccuracy)) +
+     geom_col(fill = "steelblue") +
+     geom_text(aes(label = paste0(round(MeanDecreaseAccuracy, 1), "%")),
+               hjust = -0.1, size = 3.5) +
+     coord_flip() +
+     labs(title = "rf_move_math: What Predicts Progress Direction?",
+          subtitle = "Math — Declining vs Stable vs Improving",
+          x = NULL, y = "Mean Decrease Accuracy") +
+     theme_minimal()
+# famrel = 4.9% health = 2.3%
+
+# ggplot rf_move_port
+imp_port <- importance(rf_move_port, type = 1)
+imp_port_df <- data.frame(
+     variable = rownames(imp_port),
+     MeanDecreaseAccuracy = imp_port[, "MeanDecreaseAccuracy"]
+)
+imp_port_df <- imp_port_df %>% arrange(desc(MeanDecreaseAccuracy)) %>% head(10)
+
+ggplot(imp_port_df, aes(x = reorder(variable, MeanDecreaseAccuracy),
+                        y = MeanDecreaseAccuracy)) +
+     geom_col(fill = "steelblue") +
+     geom_text(aes(label = paste0(round(MeanDecreaseAccuracy, 1), "%")),
+               hjust = -0.1, size = 3.5) +
+     coord_flip() +
+     labs(title = "rf_move_port: What Predicts Progress Direction?",
+          subtitle = "Portuguese — Declining vs Stable vs Improving",
+          x = NULL, y = "Mean Decrease Accuracy") +
+     theme_minimal()
+# failures = 4.9% age = 4%
+```
+
+```{r results='hold'}
+# STEP 7: COMPARISON SUMMARY TABLE
+# ============================================================
+
+cat("\n")
+cat("============================================================\n")
+cat("       SUBJECT COMPARISON: RF vs DT (RMSE Summary)          \n")
+cat("============================================================\n")
+cat("\n")
+cat("Model              | Math RMSE | Port RMSE | Interpretation\n")
+cat("-------------------+-----------+-----------+---------------\n")
+cat(sprintf("rf_social (CV)     | %-9s | %-9s | %s\n",
+            round(min(cv_social_math$results$RMSE), 3),
+            round(min(cv_social_port$results$RMSE), 3),
+            "Lower = social vars explain more"))
+cat("\n")
+cat("DT benchmarks (from teammate's slides):\n")
+cat("  tree_social_math RMSE: 2.781\n")
+cat("  tree_move_math:  failures is only split\n")
+
+cat("============================================================\n")
+# Model              | Math RMSE | Port RMSE | Interpretation
+# rf_social (CV)     | 2.86      | 2.155     | Lower = social vars explain more
+# tree_social_math RMSE: 2.781
+# tree_move_math:  failures is only split
+
+## rf_social
+# Math RMSE = 2.86, Portuguese RMSE = 2.155. The lower RMSE for Portuguese indicates that
+# socio-behavioural variables have a stronger predictive power for Portuguese results.
+# This is consistent with the conclusions drawn by DT (RF found that socio-behavioural
+# variables have predictive power for both subjects, but the predictive accuracy is higher
+# for Portuguese, possibly due to the larger sample size)
+
+############
+cat("\n")
+cat("============================================================\n")
+cat("    RF_MOVE CLASSIFICATION RESULTS SUMMARY                   \n")
+cat("============================================================\n")
+cat("\n")
+cat("Model          | CV Accuracy | Kappa  | Interpretation\n")
+cat("---------------+-------------+--------+---------------\n")
+cat(sprintf("rf_move_math   | %-11s | %-6s | %s\n",
+            round(max(cv_move_math$results$Accuracy), 3),
+            round(max(cv_move_math$results$Kappa), 3),
+            "Can RF predict Math progress direction?"))
+cat(sprintf("rf_move_port   | %-11s | %-6s | %s\n",
+            round(max(cv_move_port$results$Accuracy), 3),
+            round(max(cv_move_port$results$Kappa), 3),
+            "Can RF predict Port progress direction?"))
+cat("\n")
+cat("Kappa interpretation:\n")
+cat("  < 0.20 = poor agreement (barely better than guessing)\n")
+cat("  0.21-0.40 = fair\n")
+cat("  0.41-0.60 = moderate\n")
+cat("  0.61-0.80 = substantial\n")
+cat("  > 0.80 = near perfect\n")
+cat("\n")
+cat("Compare with DT:\n")
+cat("  tree_move_math: only 'failures' as split\n")
+cat("  tree_move_port: single-node (no split found)\n")
+cat("  RF classification can still rank variables even\n")
+cat("  when DT finds no useful splits\n")
+cat("============================================================\n")
+# Model          | CV Accuracy | Kappa  | Interpretation
+# rf_move_math   | 0.491       | 0.011  | Can RF predict Math progress direction?
+# rf_move_port   | 0.498       | 0.089  | Can RF predict Port progress direction?
+
+# Kappa interpretation:
+# 0.20 = poor agreement (barely better than guessing)
+# 0.21-0.40 = fair
+# 0.41-0.60 = moderate
+# 0.61-0.80 = substantial
+# 0.80 = near perfect
+
+# Compare with DT:
+# tree_move_math: only 'failures' as split
+# tree_move_port: single-node (no split found)
+# RF classification can still rank variables even
+# when DT finds no useful splits
+```
+
+## SVM 
+
+
+```{r svm}
+#### Running a SVM using all the data in order to see how accurate
+#### the model is before the sub segments are utilized.
+library(e1071)
+library(kernlab)
+library(caret)
+
+set.seed(123)
+a_df_preemptive <- df_preemptive %>%
+   mutate(progress_segment = cut(G3_progress, 
+                                 breaks = c(-Inf, -0.1, 0.1, Inf), 
+                                 labels = c("Declining", "Stable", "Improving")))
+a_splitting <- sample(1:nrow(a_df_preemptive), 0.8 * nrow(a_df_preemptive))
+a_train_data <- a_df_preemptive[a_splitting, ]
+a_test_data  <- a_df_preemptive[-a_splitting, ]
+
+a_tuned <- tune(svm, progress_segment ~ . -G3 -G3_progress,
+                data = a_train_data, kernel = "radial",
+                ranges = list(cost  = c(0.1, 1, 10, 50, 100, 200),
+                              gamma = c(0.001, 0.01, 0.05, 0.1, 0.5, 1, 2)))
+
+a_best_radial <- a_tuned$best.model
+
+a_ypred_radial <- predict(a_best_radial, a_test_data)
+a_test_table_radial <- table(Predicted = a_ypred_radial,
+                             Actual = a_test_data$progress_segment)
+#                       Actual
+# Predicted   Declining Stable Improving
+# Declining         0      0         0
+# Stable           17     37        15
+# Improving         0      0         0
+a_correct_pred_radial <- sum(diag(a_test_table_radial)) / sum(a_test_table_radial)
+a_error_rate_radial <- 1 - a_correct_pred_radial
+cat("The error rate: ", a_error_rate_radial)
+# The error rate:  0.4637681
+
+### Running a SVM using the sub segments. There are two main packages for SVM
+### work in R: e1071 and kernlab. They both produce SVMs but they use different
+### code to do so. I am trying them both to see the results, first.
+
+### For df_preemptive_math
+set.seed(123)
+m_splitting <- sample(1:nrow(df_preemptive_math), 0.8 * nrow(df_preemptive_math))
+m_train_data <- df_preemptive_math[m_splitting, ]
+m_test_data  <- df_preemptive_math[-m_splitting, ]
+
+# using e1071
+# Please note that the rminer package merely places a wrapper around the e1071
+# package for SVM. This package is the one that did all the work under the hood
+# for the paper.
+em_tuned <- tune(svm, progress_segment ~ . -G3 -G3_progress,
+                 data = m_train_data, kernel = "radial",
+                 ranges = list(cost  = c(0.1, 1, 10, 50, 100, 200),
+                               gamma = c(0.001, 0.01, 0.05, 0.1, 0.5, 1, 2)))
+summary(em_tuned)
+em_best_radial <- em_tuned$best.model
+
+em_ypred_radial <- predict(em_best_radial, m_test_data)
+em_test_table_radial <- table(Predicted = em_ypred_radial,
+                              Actual = m_test_data$progress_segment)
+#                       Actual
+# Predicted   Declining Stable Improving
+# Declining         0      0         0
+# Stable           11     42        19
+# Improving         0      0         0
+print(em_test_table_radial)
+em_correct_pred_radial <- sum(diag(em_test_table_radial)) / sum(em_test_table_radial)
+em_error_rate_radial <- 1 - em_correct_pred_radial
+cat("The error rate: ", em_error_rate_radial)
+# The error rate:  0.4166667
+
+# using kernlab
+library(kernlab)
+km_svm_model <- ksvm(progress_segment ~ . -G3 -G3_progress,
+                     data = m_train_data,
+                     kernel = "rbfdot",
+                     prob.model = TRUE,
+                     scaled = TRUE)
+km_svm_predict <- predict(km_svm_model, m_test_data)
+
+km_confusion_matrix <- table(Predicted = km_svm_predict,
+                             Actual = m_test_data$progress_segment)
+#                       Actual
+# Predicted   Declining Stable Improving
+# Declining         0      0         0
+# Stable           10     36        18
+# Improving         1      6         1
+print(km_confusion_matrix)
+km_accuracy <- sum(diag(km_confusion_matrix)) / sum(km_confusion_matrix)
+km_error_rate <- 1 - km_accuracy
+cat("The error rate: ", km_error_rate)
+# The error rate:  0.4861111
+
+# The issue for both of the above models is that they aren't truly partitioning
+# out the predictions - they're just guessing. This is because of the class
+# imbalance between Stable and the others.
+
+### For df_preemptive_port
+set.seed(123)
+p_splitting <- sample(1:nrow(df_preemptive_port), 0.8 * nrow(df_preemptive_port))
+p_train_data <- df_preemptive_port[p_splitting, ]
+p_test_data  <- df_preemptive_port[-p_splitting, ]
+
+# using e1071
+library(e1071)
+ep_tuned <- tune(svm, progress_segment ~ . -G3 -G3_progress,
+                 data = p_train_data, kernel = "radial",
+                 ranges = list(cost  = c(0.1, 1, 10, 50, 100, 200),
+                               gamma = c(0.001, 0.01, 0.05, 0.1, 0.5, 1, 2)))
+summary(ep_tuned)
+ep_best_radial <- ep_tuned$best.model
+
+ep_ypred_radial <- predict(ep_best_radial, p_test_data)
+ep_test_table_radial <- table(Predicted = ep_ypred_radial,
+                              Actual = p_test_data$progress_segment)
+#                       Actual
+# Predicted   Declining Stable Improving
+# Declining         0      0         0
+# Stable            0      1         2
+# Improving         7     57        60
+print(ep_test_table_radial)
+ep_correct_pred_radial <- sum(diag(ep_test_table_radial)) / sum(ep_test_table_radial)
+ep_error_rate_radial <- 1 - ep_correct_pred_radial
+cat("The error rate: ", ep_error_rate_radial)
+# The error rate:  0.519685
+
+# using kernlab
+library(kernlab)
+kp_svm_model <- ksvm(progress_segment ~ . -G3 -G3_progress,
+                     data = p_train_data,
+                     kernel = "rbfdot",
+                     prob.model = TRUE,
+                     scaled = TRUE)
+kp_svm_predict <- predict(kp_svm_model, p_test_data)
+
+kp_confusion_matrix <- table(Predicted = kp_svm_predict,
+                             Actual = p_test_data$progress_segment)
+#                       Actual
+# Predicted   Declining Stable Improving
+# Declining         0      0         0
+# Stable            3     20        25
+# Improving         4     38        37
+print(kp_confusion_matrix)
+kp_accuracy <- sum(diag(kp_confusion_matrix)) / sum(kp_confusion_matrix)
+kp_error_rate <- 1 - kp_accuracy
+cat("The error rate: ", kp_error_rate)
+# The error rate:  0.5511811
+
+# These models are also just guessing since there's nothing there for the
+# Declining section. But they are at least trying on Stable and Improving,
+# which is a minor improvement from the Math section.
+
+# There are two main issues that need to be rectified for the SVM to be useful
+# for this data. The first is the class imbalance issue. The second is that
+# the model needs to focus on the Declining portion, since it is needed
+# for early intervention.
+
+table(df_preemptive_math$progress_segment)
+# Declining    Stable Improving 
+#        65       181       111 
+table(df_preemptive_port$progress_segment)
+# Declining    Stable Improving 
+#        64       280       290
+
+library(caret)
+library(kernlab)
+shared_tune_grid <- expand.grid(
+  sigma = c(0.005, 0.01, 0.02, 0.05, 0.1, 0.15),
+  C     = c(0.5, 1, 5, 10, 25, 50, 100)
+)
+shared_preprocess <- c("center", "scale", "nzv")
+shared_class_weights <- c("Declining" = 4, "Stable" = 1, "Improving" = 3)
+
+# I experimented with weighting the SVM but quickly found that it was not
+# enough. The model consistently predicted Stable due to the class imbalance.
+# Various methods of correcting the class imbalance were investigated, however, 
+# constrained as I was with working with a SVM, the results were not good. I
+# tried using both SMOTE and ADASYN, but did not receive viable results for
+# either. Hence, I realized that I needed to bring in G2 if I wanted the SVM to
+# produce any valid results.
+
+### Math SVM with G2 Data
+set.seed(123)
+# Creating data splits that include G2
+df_math_change <- d1_math_clean %>%
+   mutate(G2 = as.numeric(G2),
+          G3_progress = G3 - G2) %>%
+   mutate(progress_segment = cut(G3_progress, 
+                                 breaks = c(-Inf, -0.1, 0.1, Inf), 
+                                 labels = c("Declining", "Stable", "Improving"))) %>%
+   select(-G1, -G3, -G3_progress)
+
+# Ensuring that the data partition is not trying to partition an empty section
+df_math_change$progress_segment <- as.factor(df_math_change$progress_segment)
+df_math_change$progress_segment <- droplevels(df_math_change$progress_segment)
+success <- FALSE
+while (!success) {
+  m_splitting <- try(createDataPartition(df_math_change$progress_segment, 
+                                         p = 0.8, 
+                                         list = FALSE), 
+                     silent = TRUE)
+    if (!inherits(m_splitting, "try-error")) {
+    success <- TRUE
+  }
+}
+m_train_data <- df_math_change[m_splitting, ]
+m_test_data  <- df_math_change[-m_splitting, ]
+
+m_train_data <- m_train_data %>% mutate(across(where(is.character), as.factor))
+
+library(caret)
+# After a good deal of trial and error, I changed the method to svmLinear which
+# gave me what I wanted, in that it is now attempting to predict on all three
+# categories instead of only predicting Stable each time.
+# I also changed the trControl to the following due to the svmLinear switch.
+m_svm <- train(
+   progress_segment ~ ., 
+   data = m_train_data, 
+   method = "svmLinear",
+   trControl = trainControl(method = "cv", number = 10),
+   preProcess = shared_preprocess,
+   weights = shared_class_weights[m_train_data$progress_segment]
+)
+
+m_pred <- predict(m_svm, m_test_data)
+m_table <- table(Predicted = m_pred, Actual = m_test_data$progress_segment)
+print(m_table)
+#                       Actual
+# Predicted   Declining Stable Improving
+# Declining         3      5         6
+# Stable           13     29        15
+# Improving         2      4         1
+m_accuracy <- sum(diag(m_table)) / sum(m_table)
+cat("Error Rate:", 1 - m_accuracy)
+# Error Rate: 0.5769231
+
+# Then I found the most important features.
+m_importance <- varImp(m_svm, scale = TRUE)
+plot(m_importance, top = 10, main = "Math: Top Factors Linked to Grade Decline")
+
+# I knew I wanted to get the weighted values to see which ones had the greatest
+# impact. I used Google AI for this to figure out how to get the weights out.
+m_weights <- as.data.frame(t(m_svm$finalModel@coef[[1]] %*% m_svm$finalModel@xmatrix[[1]]))
+m_weights$Feature <- rownames(m_weights)
+colnames(m_weights)[1] <- "Weight"
+
+m_top_social_issues <- m_weights %>%
+   mutate(Importance = abs(Weight)) %>%
+   arrange(desc(Importance)) %>%
+   head(10)
+
+ggplot(m_top_social_issues, aes(x = reorder(Feature, Importance), y = Importance)) +
+   geom_point(size = 3, color = "darkred") +
+   coord_flip() +
+   theme_minimal() +
+   labs(title = "Math: Social Issues Most Linked to Grade Decline",
+        x = "Social/Academic Factor",
+        y = "Relative Impact Strength")
+
+### Portuguese SVM with G2 Data
+set.seed(123)
+df_port_change <- d2_port_clean %>%
+   mutate(G2 = as.numeric(G2),
+          G3_progress = G3 - G2) %>%
+   mutate(progress_segment = cut(G3_progress, 
+                                 breaks = c(-Inf, -0.1, 0.1, Inf), 
+                                 labels = c("Declining", "Stable", "Improving"))) %>%
+   select(-G1, -G3, -G3_progress)
+
+# Ensuring that the data partition is not trying to partition an empty section
+df_port_change$progress_segment <- as.factor(df_port_change$progress_segment)
+df_port_change$progress_segment <- droplevels(df_port_change$progress_segment)
+success <- FALSE
+while (!success) {
+  p_splitting <- try(createDataPartition(df_port_change$progress_segment, 
+                                         p = 0.8, 
+                                         list = FALSE), 
+                     silent = TRUE)
+    if (!inherits(p_splitting, "try-error")) {
+    success <- TRUE
+  }
+}
+p_train_data <- df_port_change[p_splitting, ]
+p_test_data  <- df_port_change[-p_splitting, ]
+
+p_train_data <- p_train_data %>% mutate(across(where(is.character), as.factor))
+
+p_svm <- train(
+   progress_segment ~ ., 
+   data = p_train_data, 
+   method = "svmLinear",
+   trControl = trainControl(method = "cv", number = 10),
+   preProcess = shared_preprocess,
+   weights = shared_class_weights[p_train_data$progress_segment]
+)
+p_pred <- predict(p_svm, p_test_data)
+p_table <- table(Predicted = p_pred, Actual = p_test_data$progress_segment)
+print(p_table)
+#                       Actual
+# Predicted   Declining Stable Improving
+# Declining         0      0         0
+# Stable            2     28        31
+# Improving        12     29        27
+p_accuracy <- sum(diag(p_table)) / sum(p_table)
+cat("Error Rate:", 1 - p_accuracy)
+# Error Rate: 0.5736434
+
+p_importance <- varImp(p_svm, scale = TRUE)
+plot(p_importance, top = 10, main = "Portuguese: Top Factors Linked to Grade Decline")
+
+p_svm_weights <- as.data.frame(t(p_svm$finalModel@coef[[1]] %*% p_svm$finalModel@xmatrix[[1]]))
+p_svm_weights$Feature <- rownames(p_svm_weights)
+colnames(p_svm_weights)[1] <- "Weight"
+p_top_social_issues <- p_svm_weights %>%
+   mutate(Importance = abs(Weight)) %>%
+   arrange(desc(Importance)) %>%
+   head(10)
+
+library(ggplot2)
+ggplot(p_top_social_issues, aes(x = reorder(Feature, Importance), y = Importance)) +
+   geom_point(size = 3, color = "darkred") +
+   coord_flip() +
+   theme_minimal() +
+   labs(title = "Portuguese: Social Issues Most Linked to Grade Decline",
+        x = "Social/Academic Factor",
+        y = "Relative Impact Strength")
+
+# The issue here for the Portuguese one is that this model is, again, not
+# predicting for Declining at all, only on Stable and Improving. I thought that
+# reducing the number of features even further would help improve the model. I
+# created a new index in which I combined the alcohol categories of Walc and Dalc.
+
+### Portuguese SVM with G2 Data and New Index
+library(themis)
+set.seed(123)
+df_port_change_ni <- d2_port_clean %>%
+   mutate(
+      G2 = as.numeric(G2),
+      G3_progress = G3 - G2,
+      # combining alcohol troubles
+      alcohol = Walc + Dalc,
+   ) %>%
+   mutate(progress_segment = cut(G3_progress, 
+                                 breaks = c(-Inf, -0.1, 0.1, Inf), 
+                                 labels = c("Declining", "Stable", "Improving"))) %>%
+   select(-G1, -G3, -G3_progress, -Walc, -Dalc) %>%
+   mutate(across(where(is.character), as.factor))
+
+# Ensuring that the data partition is not trying to partition an empty section
+df_port_change_ni$progress_segment <- as.factor(df_port_change_ni$progress_segment)
+df_port_change_ni$progress_segment <- droplevels(df_port_change_ni$progress_segment)
+success <- FALSE
+while (!success) {
+  p_splitting_ni <- try(createDataPartition(df_port_change_ni$progress_segment, 
+                                          p = 0.8, 
+                                          list = FALSE), 
+                     silent = TRUE)
+    if (!inherits(p_splitting_ni, "try-error")) {
+    success <- TRUE
+  }
+}
+p_train_data_ni <- df_port_change_ni[p_splitting_ni, ]
+p_test_data_ni  <- df_port_change_ni[-p_splitting_ni, ]
+
+class_weights_ni <- c("Declining" = 30, "Stable" = 1, "Improving" = 1.5)
+control_svm_ni <- trainControl(
+  method = "repeatedcv", 
+  number = 10, 
+  repeats = 3,
+  sampling = "smote" # decided to use this one based on my previous research
+)
+
+p_svm_ni <- train(
+   progress_segment ~ ., 
+   data = p_train_data_ni, 
+   method = "svmRadial",
+   trControl = control_svm_ni,
+   preProcess = shared_preprocess,
+   tuneGrid = shared_tune_grid,
+   weights = class_weights_ni[p_train_data_ni$progress_segment]
+)
+p_pred_ni <- predict(p_svm_ni, p_test_data_ni)
+p_table_ni <- table(Predicted = p_pred_ni, Actual = p_test_data_ni$progress_segment)
+print(p_table_ni)
+#                       Actual
+# Predicted   Declining Stable Improving
+# Declining         1      0         2
+# Stable            8     34        20
+# Improving         5     23        36
+p_accuracy_ni <- sum(diag(p_table_ni)) / sum(p_table_ni)
+cat("Accuracy:", p_accuracy_ni)
+# Accuracy: 0.5503876
+cat("Error Rate:", 1 - p_accuracy_ni)
+# Error Rate: 0.4496124
+
+p_importance_ni <- varImp(p_svm_ni, scale = TRUE)
+plot(p_importance_ni, top = 10,
+     main = "Portuguese: New Index: Top Factors Linked to Grade Decline")
+
+p_weights_ni <- as.data.frame(t(p_svm_ni$finalModel@coef[[1]] %*% 
+                                  p_svm_ni$finalModel@xmatrix[[1]]))
+p_weights_ni$Feature <- rownames(p_weights_ni)
+colnames(p_weights_ni)[1] <- "Weight"
+p_top_social_issues_ni <- p_weights_ni %>%
+   mutate(Importance = abs(Weight)) %>%
+   arrange(desc(Importance)) %>%
+   head(10)
+
+library(ggplot2)
+ggplot(p_top_social_issues_ni, aes(x = reorder(Feature, Importance), y = Importance)) +
+   geom_point(size = 3, color = "darkred") +
+   coord_flip() +
+   theme_minimal() +
+   labs(title = "Portuguese: New Index: Social Issues Most Linked to Grade Decline",
+        x = "Social/Academic Factor",
+        y = "Relative Impact Strength")
+
+# This model is clearly improved, however, the accuracy still is not fantastic
+# at 0.5503876. The model is only barely doing better than a coin flip. The SVM
+# model is not the best in finding the social causes of student performance, 
+# especially, with such a small dataset.
+```
+
+## Neural Network 
+
+```{r nnetwork}
+required_packages <- c("dplyr", "nnet", "caret", "ggplot2", "reshape2")
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+
+# 1. TARGET VARIABLE
+# Binary classification: "Pass" (G3 >= 10) vs "Fail" (G3 < 10)
+# Remove G3 = 0 rows (withdrawn / missing, per MasterData.R)
+df_model <- df_clean %>%
+  filter(G3 > 0) %>%
+  mutate(Pass = factor(ifelse(G3 >= 10, "Pass", "Fail"),
+                       levels = c("Fail", "Pass")))
+
+cat(sprintf("Rows after filtering G3=0: %d\n", nrow(df_model)))
+cat("Class distribution:\n")
+print(table(df_model$Pass))
+
+# 2. FEATURE SELECTION
+# Drop raw grade columns to avoid data leakage:
+#   - G1, G2 are intermediate grades; using them makes prediction trivial.
+#   - G3 is what we derived Pass from.
+#   - G3_progress (if present) would also leak.
+drop_cols <- c("G1", "G2", "G3")
+features  <- df_model %>% select(-all_of(drop_cols), -Pass)
+
+# Dummy-encode all remaining factors
+dummy_recipe <- dummyVars(~ ., data = features, fullRank = TRUE)
+X <- predict(dummy_recipe, newdata = features)
+X <- as.data.frame(X)
+
+y <- df_model$Pass
+
+cat(sprintf("Feature matrix: %d rows × %d columns\n", nrow(X), ncol(X)))
+
+# 3. TRAIN / TEST SPLIT  (80 / 20, stratified)
+set.seed(42)
+train_idx   <- createDataPartition(y, p = 0.80, list = FALSE)
+X_train     <- X[train_idx, ]
+X_test      <- X[-train_idx, ]
+y_train     <- y[train_idx]
+y_test      <- y[-train_idx]
+
+# 4. CLASS WEIGHTS  (inverse-frequency weighting to penalise missed Fails)
+# Weight for each training observation = N / (n_classes * class_count)
+# This makes the network treat each Fail as ~3x more important than a Pass,
+# proportional to the actual imbalance in the training set.
+class_counts <- table(y_train)
+n_total      <- length(y_train)
+n_classes    <- length(class_counts)
+
+class_weights <- n_total / (n_classes * class_counts)
+cat(sprintf("\nClass weights  →  Fail: %.3f  |  Pass: %.3f\n",
+            class_weights["Fail"], class_weights["Pass"]))
+
+# Map each training observation to its weight
+obs_weights <- ifelse(y_train == "Fail",
+                      class_weights["Fail"],
+                      class_weights["Pass"])
+
+# 5. FEATURE SCALING  (min-max → [0, 1], fitted on train only)
+preproc <- preProcess(X_train, method = c("range"))
+X_train_sc <- predict(preproc, X_train)
+X_test_sc  <- predict(preproc, X_test)
+
+# 6. NEURAL NETWORK TRAINING  (nnet – single hidden layer, class-weighted)
+cat("\nTraining neural network with 5-fold cross-validation (class-weighted)...\n")
+
+# Custom summary so caret selects on F1 / Kappa rather than ROC
+f1_kappa_summary <- function(data, lev = NULL, model = NULL) {
+  # Standard two-class metrics
+  two  <- twoClassSummary(data, lev = lev, model = model)
+  # Default metrics (Accuracy, Kappa)
+  def  <- defaultSummary(data, lev = lev, model = model)
+
+  # F1 for the minority class (Fail = first level)
+  cm_cv  <- confusionMatrix(data$pred, data$obs, positive = lev[1])
+  f1_val <- cm_cv$byClass["F1"]
+  if (is.na(f1_val)) f1_val <- 0
+
+  c(two, def, F1 = as.numeric(f1_val))
+}
+
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = f1_kappa_summary,
+  savePredictions = "final"
+)
+
+# Wider decay range helps with class-weighted loss landscapes
+grid <- expand.grid(
+  size  = c(5, 10, 15, 20),
+  decay = c(0.001, 0.01, 0.05, 0.1, 0.5)
+)
+
+train_data <- cbind(X_train_sc, Pass = y_train)
+
+set.seed(42)
+nn_model <- train(
+  Pass ~ .,
+  data      = train_data,
+  method    = "nnet",
+  trControl = ctrl,
+  tuneGrid  = grid,
+  metric    = "Kappa",        # optimise on Kappa; F1 also logged
+  weights   = obs_weights,    # <-- inverse-frequency class weights
+  maxit     = 500,
+  trace     = FALSE,
+  linout    = FALSE
+)
+
+cat("\nBest hyperparameters:\n")
+print(nn_model$bestTune)
+
+# 7. EVALUATION ON TEST SET
+pred_prob  <- predict(nn_model, newdata = X_test_sc, type = "prob")
+
+# --- 7a. ROC-AUC (threshold-independent) ------------------------------------
+if (!requireNamespace("pROC", quietly = TRUE)) install.packages("pROC")
+library(pROC)
+roc_obj <- roc(y_test, pred_prob[, "Pass"], quiet = TRUE)
+
+# --- 7b. Find the optimal threshold via CV probabilities --------------------
+# Use the out-of-fold predictions saved during cross-validation to pick the
+# threshold that maximises Kappa — this keeps threshold selection honest
+# (no test-set peeking).
+cv_probs  <- nn_model$pred                          # OOF predictions
+cv_probs  <- cv_probs[cv_probs$size  == nn_model$bestTune$size &
+                      cv_probs$decay == nn_model$bestTune$decay, ]
+
+thresholds <- seq(0.30, 0.80, by = 0.02)
+
+threshold_results <- sapply(thresholds, function(thr) {
+  preds <- factor(ifelse(cv_probs$Pass >= thr, "Pass", "Fail"),
+                  levels = c("Fail", "Pass"))
+  cm_t  <- confusionMatrix(preds, cv_probs$obs, positive = "Pass")
+  c(Kappa   = as.numeric(cm_t$overall["Kappa"]),
+    F1      = as.numeric(cm_t$byClass["F1"]),
+    BalAcc  = as.numeric(cm_t$byClass["Balanced Accuracy"]))
+})
+
+threshold_df         <- as.data.frame(t(threshold_results))
+threshold_df$threshold <- thresholds
+
+best_thr <- threshold_df$threshold[which.max(threshold_df$Kappa)]
+cat(sprintf("\nOptimal CV threshold (max Kappa): %.2f\n", best_thr))
+
+# --- 7c. Apply both thresholds and compare ----------------------------------
+make_preds <- function(thr) {
+  factor(ifelse(pred_prob[, "Pass"] >= thr, "Pass", "Fail"),
+         levels = c("Fail", "Pass"))
+}
+
+pred_default <- make_preds(0.50)
+pred_tuned   <- make_preds(best_thr)
+
+cm_default <- confusionMatrix(pred_default, y_test, positive = "Pass")
+cm_tuned   <- confusionMatrix(pred_tuned,   y_test, positive = "Pass")
+
+print_metrics <- function(cm, label) {
+  cat(sprintf("\n--- %s ---\n", label))
+  cat(sprintf("  Accuracy        : %.4f\n", cm$overall["Accuracy"]))
+  cat(sprintf("  Kappa           : %.4f\n", cm$overall["Kappa"]))
+  cat(sprintf("  Sensitivity     : %.4f   (Fails correctly caught)\n",
+              cm$byClass["Sensitivity"]))
+  cat(sprintf("  Specificity     : %.4f   (Passes correctly identified)\n",
+              cm$byClass["Specificity"]))
+  cat(sprintf("  Precision       : %.4f\n", cm$byClass["Pos Pred Value"]))
+  cat(sprintf("  F1 Score        : %.4f\n", cm$byClass["F1"]))
+  cat(sprintf("  Balanced Acc.   : %.4f\n", cm$byClass["Balanced Accuracy"]))
+  cat("  Confusion Matrix:\n")
+  print(cm$table)
+}
+
+cat("\n")
+cat("           NEURAL NETWORK – ACCURACY METRICS\n")
+cat(sprintf("  ROC-AUC (threshold-independent) : %.4f\n", auc(roc_obj)))
+
+print_metrics(cm_default, "Default threshold = 0.50")
+print_metrics(cm_tuned,   sprintf("Tuned threshold  = %.2f  (CV-optimal)", best_thr))
+
+# Keep cm pointing to the tuned model for the plots below
+cm <- cm_tuned
+
+# 8. PLOTS
+
+# --- 8a. Confusion Matrix Heatmap ---
+cm_df <- as.data.frame(cm$table)
+colnames(cm_df) <- c("Predicted", "Actual", "Freq")
+
+p_cm <- ggplot(cm_df, aes(x = Predicted, y = Actual, fill = Freq)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = Freq), size = 7, fontface = "bold") +
+  scale_fill_gradient(low = "#d6eaf8", high = "#1a5276") +
+  labs(title = "Confusion Matrix – Neural Network",
+       x = "Predicted Class", y = "Actual Class") +
+  theme_minimal(base_size = 14)
+
+print(p_cm)
+
+# --- 8b. ROC Curve ---
+if (exists("roc_obj")) {
+  roc_df <- data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities
+  )
+  p_roc <- ggplot(roc_df, aes(x = FPR, y = TPR)) +
+    geom_line(colour = "#1a5276", linewidth = 1.2) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+    annotate("text", x = 0.65, y = 0.15,
+             label = sprintf("AUC = %.4f", auc(roc_obj)),
+             size = 5, colour = "#1a5276") +
+    labs(title = "ROC Curve – Neural Network",
+         x = "False Positive Rate (1 – Specificity)",
+         y = "True Positive Rate (Sensitivity)") +
+    theme_minimal(base_size = 14)
+  print(p_roc)
+}
+
+# --- 8c. Cross-validation tuning profile (Kappa) ---
+p_tune <- ggplot(nn_model$results,
+                 aes(x = factor(size), y = Kappa,
+                     colour = factor(decay), group = factor(decay))) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  labs(title  = "CV Tuning: Hidden Units vs Kappa",
+       x      = "Hidden Units (size)",
+       y      = "Cross-validated Kappa",
+       colour = "Weight Decay") +
+  theme_minimal(base_size = 14)
+
+print(p_tune)
+
+# --- 8d. Threshold sensitivity curve ---------------------------------------
+thr_long <- reshape2::melt(threshold_df, id.vars = "threshold",
+                           variable.name = "Metric", value.name = "Score")
+
+p_thr <- ggplot(thr_long, aes(x = threshold, y = Score,
+                               colour = Metric, group = Metric)) +
+  geom_line(linewidth = 1.1) +
+  geom_vline(xintercept = best_thr, linetype = "dashed",
+             colour = "grey30", linewidth = 0.8) +
+  annotate("text", x = best_thr + 0.02, y = 0.15,
+           label = sprintf("Optimal\n%.2f", best_thr),
+           hjust = 0, size = 4, colour = "grey30") +
+  scale_colour_manual(values = c(Kappa  = "#1a5276",
+                                 F1     = "#e67e22",
+                                 BalAcc = "#27ae60")) +
+  labs(title  = "Threshold Sensitivity (CV out-of-fold predictions)",
+       x      = "Pass Probability Threshold",
+       y      = "Score",
+       colour = "Metric") +
+  theme_minimal(base_size = 14)
+
+print(p_thr)
+
+cat("\nDone. Four plots have been rendered.\n")
+
+```
