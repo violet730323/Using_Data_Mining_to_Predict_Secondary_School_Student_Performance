@@ -1,6 +1,4 @@
 # Predicting Secondary School Student Performance
-**Team 13 — MSBA Data Mining Project**  
-Latisha Khorana · Bryce Marin · Violet Zhao · Turner Mathieux
 
 ---
 
